@@ -24,7 +24,7 @@ try:
 except FileNotFoundError:
     servers = {}
 
-# === Discord bot setup ===
+# === Discord setup ===
 intents = discord.Intents.default()
 intents.guilds = True
 client = discord.Client(intents=intents)
@@ -56,7 +56,20 @@ async def get_stream_data(username, token):
                 return None
             return data["data"][0]
 
-# === Save function ===
+async def get_user_profile(username, token):
+    url = f"https://api.twitch.tv/helix/users?login={username}"
+    headers = {
+        "Client-ID": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {token}"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json()
+            if len(data["data"]) == 0:
+                return None
+            return data["data"][0]["profile_image_url"]
+
+# === Save ===
 def save_servers():
     with open(DATA_FILE, "w") as f:
         json.dump(servers, f, indent=4)
@@ -69,11 +82,10 @@ async def ping(interaction: discord.Interaction):
 @tree.command(name="add_streamer", description="Add a Twitch streamer")
 async def add_streamer(interaction: discord.Interaction, streamer_name: str):
     guild_id = str(interaction.guild_id)
-    channel_id = interaction.channel_id
 
     if guild_id not in servers:
         servers[guild_id] = {
-            "channel_id": channel_id,
+            "channel_id": interaction.channel_id,
             "streamers": [],
             "role_id": None
         }
@@ -123,6 +135,24 @@ async def set_role(interaction: discord.Interaction, role: discord.Role):
 
     await interaction.response.send_message(f"{role.mention} will now be pinged.")
 
+# ✅ NEW COMMAND
+@tree.command(name="set_channel", description="Set the channel for live notifications")
+async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_id = str(interaction.guild_id)
+
+    if guild_id not in servers:
+        servers[guild_id] = {
+            "channel_id": channel.id,
+            "streamers": [],
+            "role_id": None
+        }
+    else:
+        servers[guild_id]["channel_id"] = channel.id
+
+    save_servers()
+
+    await interaction.response.send_message(f"Notifications will now be sent in {channel.mention}")
+
 # === Stream checker ===
 live_status = {}
 
@@ -144,9 +174,10 @@ async def check_streams():
                 game_name = stream_data["game_name"]
                 thumbnail_url = stream_data["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
 
+                profile_pic = await get_user_profile(streamer, token)
+
                 twitch_url = f"https://www.twitch.tv/{streamer}"
 
-                # Embed (clean)
                 embed = discord.Embed(
                     title=title,
                     url=twitch_url,
@@ -155,15 +186,22 @@ async def check_streams():
                 )
 
                 embed.add_field(name="Game", value=game_name, inline=True)
+
+                if profile_pic:
+                    embed.set_thumbnail(url=profile_pic)
+
                 embed.set_image(url=thumbnail_url)
 
-                # Role ping
+                embed.set_footer(
+                    text="Twitch",
+                    icon_url="https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
+                )
+
                 role_id = data.get("role_id")
                 role_ping = f"<@&{role_id}>" if role_id else ""
 
-                # Final message format
                 await channel.send(
-                    f"{role_ping}\n{streamer} is live now!\n{twitch_url}",
+                    f"{role_ping}\n**{streamer} is live on Twitch!**\n{twitch_url}",
                     embed=embed
                 )
 
@@ -172,7 +210,7 @@ async def check_streams():
             elif not stream_data:
                 live_status[key] = False
 
-# === Ready event ===
+# === Ready ===
 @client.event
 async def on_ready():
     await tree.sync()
