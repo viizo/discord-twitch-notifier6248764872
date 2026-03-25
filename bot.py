@@ -5,18 +5,19 @@ import aiohttp
 import asyncio
 import os
 import json
+import datetime
 
-# === Discord settings ===
+# === Discord bot token ===
 TOKEN = os.environ["DISCORD_TOKEN"]
 
 # === Twitch settings ===
 TWITCH_CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 TWITCH_CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 
-# File to store server data
+# JSON file to store server-specific streamers
 DATA_FILE = "servers.json"
 
-# Load server data from JSON, or create empty dict
+# Load existing server data or create empty dict
 try:
     with open(DATA_FILE, "r") as f:
         servers = json.load(f)
@@ -27,7 +28,6 @@ except FileNotFoundError:
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
-
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -44,7 +44,7 @@ async def get_twitch_token():
             data = await resp.json()
             return data["access_token"]
 
-async def is_live(username, token):
+async def get_stream_data(username, token):
     url = f"https://api.twitch.tv/helix/streams?user_login={username}"
     headers = {
         "Client-ID": TWITCH_CLIENT_ID,
@@ -53,7 +53,9 @@ async def is_live(username, token):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             data = await resp.json()
-            return len(data["data"]) > 0
+            if len(data["data"]) == 0:
+                return None
+            return data["data"][0]
 
 # === Helper functions ===
 def save_servers():
@@ -76,7 +78,7 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str):
         save_servers()
         await interaction.response.send_message(f"Added streamer `{streamer_name}`.")
     else:
-        await interaction.response.send_message(f"Streamer `{streamer_name}` is already in the list.")
+        await interaction.response.send_message(f"Streamer `{streamer_name}` is already tracked.")
 
 @tree.command(name="remove_streamer", description="Remove a Twitch streamer from this server")
 async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
@@ -86,7 +88,7 @@ async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
         save_servers()
         await interaction.response.send_message(f"Removed streamer `{streamer_name}`.")
     else:
-        await interaction.response.send_message(f"Streamer `{streamer_name}` not found in the list.")
+        await interaction.response.send_message(f"Streamer `{streamer_name}` not found.")
 
 @tree.command(name="list_streamers", description="List all Twitch streamers tracked in this server")
 async def list_streamers(interaction: discord.Interaction):
@@ -106,13 +108,31 @@ async def check_streams():
     for guild_id, data in servers.items():
         channel = client.get_channel(data["channel_id"])
         for streamer in data["streamers"]:
-            live = await is_live(streamer, token)
+            stream_data = await get_stream_data(streamer, token)
             key = f"{guild_id}_{streamer}"
-            if live and not live_status.get(key, False):
-                twitch_url = f"https://www.twitch.tv/{streamer}"
-                await channel.send(f"{streamer} is live!\n{twitch_url}")
+            if stream_data and not live_status.get(key, False):
+                # Build embed
+                title = stream_data["title"]
+                game_name = stream_data["game_name"]
+                viewers = stream_data["viewer_count"]
+                started_at = datetime.datetime.fromisoformat(stream_data["started_at"].replace("Z", "+00:00"))
+                thumbnail_url = stream_data["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
+
+                embed = discord.Embed(
+                    title=f"{streamer} is live on Twitch!",
+                    url=f"https://www.twitch.tv/{streamer}",
+                    description=title,
+                    color=0x9146FF,
+                    timestamp=datetime.datetime.utcnow()
+                )
+                embed.add_field(name="Game", value=game_name, inline=True)
+                embed.add_field(name="Viewers", value=str(viewers), inline=True)
+                embed.add_field(name="Started at", value=started_at.strftime("%Y-%m-%d %H:%M UTC"), inline=False)
+                embed.set_image(url=thumbnail_url)
+
+                await channel.send(embed=embed)
                 live_status[key] = True
-            elif not live:
+            elif not stream_data:
                 live_status[key] = False
 
 # === Bot events ===
