@@ -7,6 +7,9 @@ import os
 import json
 import datetime
 
+# === YOUR SERVER ID (IMPORTANT) ===
+GUILD_ID = 1486300828699463680
+
 # === Discord bot token ===
 TOKEN = os.environ["DISCORD_TOKEN"]
 
@@ -75,11 +78,12 @@ def save_servers():
         json.dump(servers, f, indent=4)
 
 # === Commands ===
-@tree.command(name="ping", description="Check if bot works")
+
+@tree.command(name="ping", description="Check if bot works", guild=discord.Object(id=GUILD_ID))
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong!")
 
-@tree.command(name="add_streamer", description="Add a Twitch streamer")
+@tree.command(name="add_streamer", description="Add a Twitch streamer", guild=discord.Object(id=GUILD_ID))
 async def add_streamer(interaction: discord.Interaction, streamer_name: str):
     guild_id = str(interaction.guild_id)
 
@@ -97,7 +101,7 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str):
     else:
         await interaction.response.send_message("Already added.")
 
-@tree.command(name="remove_streamer", description="Remove a Twitch streamer")
+@tree.command(name="remove_streamer", description="Remove a Twitch streamer", guild=discord.Object(id=GUILD_ID))
 async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
     guild_id = str(interaction.guild_id)
 
@@ -108,7 +112,7 @@ async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
     else:
         await interaction.response.send_message("Not found.")
 
-@tree.command(name="list_streamers", description="List all streamers")
+@tree.command(name="list_streamers", description="List all streamers", guild=discord.Object(id=GUILD_ID))
 async def list_streamers(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
 
@@ -119,7 +123,7 @@ async def list_streamers(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("No streamers added.")
 
-@tree.command(name="set_role", description="Set a role to ping")
+@tree.command(name="set_role", description="Set a role to ping", guild=discord.Object(id=GUILD_ID))
 async def set_role(interaction: discord.Interaction, role: discord.Role):
     guild_id = str(interaction.guild_id)
 
@@ -135,8 +139,7 @@ async def set_role(interaction: discord.Interaction, role: discord.Role):
 
     await interaction.response.send_message(f"{role.mention} will now be pinged.")
 
-# ✅ NEW COMMAND
-@tree.command(name="set_channel", description="Set the channel for live notifications")
+@tree.command(name="set_channel", description="Set notification channel", guild=discord.Object(id=GUILD_ID))
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = str(interaction.guild_id)
 
@@ -151,7 +154,7 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
 
     save_servers()
 
-    await interaction.response.send_message(f"Notifications will now be sent in {channel.mention}")
+    await interaction.response.send_message(f"Notifications will be sent in {channel.mention}")
 
 # === Stream checker ===
 live_status = {}
@@ -175,7 +178,6 @@ async def check_streams():
                 thumbnail_url = stream_data["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
 
                 profile_pic = await get_user_profile(streamer, token)
-
                 twitch_url = f"https://www.twitch.tv/{streamer}"
 
                 embed = discord.Embed(
@@ -213,7 +215,8 @@ async def check_streams():
 # === Ready ===
 @client.event
 async def on_ready():
-    await tree.sync()
+    guild = discord.Object(id=GUILD_ID)
+    await tree.sync(guild=guild)
     check_streams.start()
     print(f"Logged in as {client.user}")
 
