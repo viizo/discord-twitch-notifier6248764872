@@ -2,7 +2,6 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 import aiohttp
-import asyncio
 import os
 import datetime
 import sqlite3
@@ -53,6 +52,13 @@ CREATE TABLE IF NOT EXISTS settings (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS manager_roles (
+    guild_id TEXT PRIMARY KEY,
+    role_id INTEGER
+)
+""")
+
 conn.commit()
 
 # === DISCORD ===
@@ -64,6 +70,16 @@ tree = app_commands.CommandTree(client)
 session = None
 twitch_token = None
 token_expiry = None
+
+# === HELPERS ===
+
+def format_message(template, name, game, title):
+    msg = template or "**{streamer} is live!**"
+    return (
+        msg.replace("{streamer}", name)
+           .replace("{game}", game)
+           .replace("{title}", title)
+    )
 
 # === TWITCH TOKEN ===
 async def get_twitch_token():
@@ -82,11 +98,14 @@ async def get_twitch_token():
     async with session.post(url, params=params) as resp:
         data = await resp.json()
         twitch_token = data["access_token"]
-        token_expiry = datetime.datetime.utcnow() + datetime.timedelta(days=50)
+        token_expiry = datetime.datetime.utcnow() + datetime.timedelta(seconds=data["expires_in"])
         return twitch_token
 
 # === TWITCH API ===
 async def get_streams(usernames):
+    if not usernames:
+        return []
+
     token = await get_twitch_token()
     params = [("user_login", u) for u in usernames]
 
@@ -102,6 +121,9 @@ async def get_streams(usernames):
         return data.get("data", [])
 
 async def get_profiles(usernames):
+    if not usernames:
+        return {}
+
     token = await get_twitch_token()
     params = [("login", u) for u in usernames]
 
@@ -116,10 +138,30 @@ async def get_profiles(usernames):
         data = await resp.json()
         return {u["login"].lower(): u["profile_image_url"] for u in data.get("data", [])}
 
-# === ADMIN CHECK ===
+# === PERMISSIONS ===
+
 def is_admin():
     async def predicate(interaction: discord.Interaction):
         return interaction.user.guild_permissions.manage_guild or interaction.user.id == interaction.guild.owner_id
+    return app_commands.check(predicate)
+
+def is_manager():
+    async def predicate(interaction: discord.Interaction):
+        if interaction.user.guild_permissions.manage_guild or interaction.user.id == interaction.guild.owner_id:
+            return True
+
+        guild_id = str(interaction.guild_id)
+
+        cursor.execute("SELECT role_id FROM manager_roles WHERE guild_id=?", (guild_id,))
+        row = cursor.fetchone()
+
+        if row:
+            role_id = row[0]
+            if any(role.id == role_id for role in interaction.user.roles):
+                return True
+
+        return False
+
     return app_commands.check(predicate)
 
 # === COMMANDS ===
@@ -128,9 +170,8 @@ def is_admin():
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong!")
 
-# SETUP
 @tree.command(name="setup", description="Quick setup")
-@is_admin()
+@is_manager()
 async def setup(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
 
@@ -142,31 +183,37 @@ async def setup(interaction: discord.Interaction):
 
     conn.commit()
 
-    await interaction.response.send_message(
-        "✅ Setup complete!\n\nUse `/add_streamer` to start.",
-        ephemeral=True
-    )
+    await interaction.response.send_message("✅ Setup complete! Use `/add_streamer`.")
 
-# ADD STREAMER
-@tree.command(name="add_streamer", description="Add a Twitch streamer")
+@tree.command(name="set_manager_role", description="Set manager role")
 @is_admin()
+async def set_manager_role(interaction: discord.Interaction, role: discord.Role):
+    guild_id = str(interaction.guild_id)
+
+    cursor.execute("""
+        INSERT INTO manager_roles VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id
+    """, (guild_id, role.id))
+
+    conn.commit()
+    await interaction.response.send_message(f"{role.mention} can manage the bot.")
+
+@tree.command(name="add_streamer", description="Add a Twitch streamer")
+@is_manager()
 async def add_streamer(interaction: discord.Interaction, streamer_name: str):
     guild_id = str(interaction.guild_id)
     streamer_name = streamer_name.lower()
 
-    # LIMIT
     cursor.execute("SELECT COUNT(*) FROM streamers WHERE guild_id=?", (guild_id,))
     if cursor.fetchone()[0] >= STREAMER_LIMIT:
         await interaction.response.send_message(f"⚠️ Max {STREAMER_LIMIT} streamers.", ephemeral=True)
         return
 
-    # VALIDATE
     profiles = await get_profiles([streamer_name])
     if streamer_name not in profiles:
         await interaction.response.send_message("❌ Streamer not found.", ephemeral=True)
         return
 
-    # DUPLICATE CHECK
     cursor.execute("SELECT 1 FROM streamers WHERE guild_id=? AND streamer_name=?", (guild_id, streamer_name))
     if cursor.fetchone():
         await interaction.response.send_message("Already added.", ephemeral=True)
@@ -178,9 +225,8 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str):
 
     await interaction.response.send_message(f"✅ Added `{streamer_name}`.")
 
-# REMOVE
 @tree.command(name="remove_streamer", description="Remove streamer")
-@is_admin()
+@is_manager()
 async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
     guild_id = str(interaction.guild_id)
     streamer_name = streamer_name.lower()
@@ -190,7 +236,6 @@ async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
 
     await interaction.response.send_message(f"Removed `{streamer_name}`.")
 
-# LIST
 @tree.command(name="list_streamers", description="List streamers")
 async def list_streamers(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
@@ -202,9 +247,8 @@ async def list_streamers(interaction: discord.Interaction):
         "\n".join(r[0] for r in rows) if rows else "No streamers."
     )
 
-# CHANNEL
 @tree.command(name="set_channel", description="Set channel")
-@is_admin()
+@is_manager()
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = str(interaction.guild_id)
 
@@ -217,9 +261,8 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
     conn.commit()
     await interaction.response.send_message(f"Set to {channel.mention}")
 
-# ROLE
 @tree.command(name="set_role", description="Set role")
-@is_admin()
+@is_manager()
 async def set_role(interaction: discord.Interaction, role: discord.Role):
     guild_id = str(interaction.guild_id)
 
@@ -232,9 +275,8 @@ async def set_role(interaction: discord.Interaction, role: discord.Role):
     conn.commit()
     await interaction.response.send_message(f"{role.mention} will be pinged")
 
-# CUSTOM MESSAGE
 @tree.command(name="set_message", description="Set custom message")
-@is_admin()
+@is_manager()
 async def set_message(interaction: discord.Interaction, message: str):
     guild_id = str(interaction.guild_id)
 
@@ -246,13 +288,11 @@ async def set_message(interaction: discord.Interaction, message: str):
     conn.commit()
     await interaction.response.send_message("Custom message set.")
 
-# TEST
 @tree.command(name="test", description="Send test")
-@is_admin()
+@is_manager()
 async def test(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
 
-    # Get channel + role
     cursor.execute("SELECT channel_id, role_id FROM guilds WHERE guild_id=?", (guild_id,))
     result = cursor.fetchone()
 
@@ -261,9 +301,11 @@ async def test(interaction: discord.Interaction):
         return
 
     channel = client.get_channel(result[0])
+    if not channel:
+        return
+
     role_ping = f"<@&{result[1]}>" if result[1] else ""
 
-    # Get streamers
     cursor.execute("SELECT streamer_name, profile_url FROM streamers WHERE guild_id=?", (guild_id,))
     rows = cursor.fetchall()
 
@@ -271,52 +313,23 @@ async def test(interaction: discord.Interaction):
         await interaction.response.send_message("Add a streamer first.", ephemeral=True)
         return
 
-    # Pick random streamer
     name, profile_url = random.choice(rows)
 
-    # Try real data
     streams = await get_streams([name])
-    stream_data = streams[0] if streams else None
+    data = streams[0] if streams else None
 
-    if stream_data:
-        title = stream_data["title"]
-        game = stream_data["game_name"]
-        thumbnail = stream_data["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
-    else:
-        title = "Test Stream"
-        game = "Just Chatting"
-        thumbnail = "https://static-cdn.jtvnw.net/previews-ttv/live_user_test-640x360.jpg"
+    title = data["title"] if data else "Test Stream"
+    game = data["game_name"] if data else "Just Chatting"
 
-    # Get custom message
     cursor.execute("SELECT custom_message FROM settings WHERE guild_id=?", (guild_id,))
     msg_row = cursor.fetchone()
     custom_msg = msg_row[0] if msg_row else None
 
-    msg = custom_msg or "**{streamer} is live!**"
-    msg = msg.replace("{streamer}", name)
-    msg = msg.replace("{game}", game)
-    msg = msg.replace("{title}", title)
+    msg = format_message(custom_msg, name, game, title)
 
-    # Embed
-    embed = discord.Embed(
-        title=title,
-        url=f"https://twitch.tv/{name}",
-        color=0x9146FF,
-        timestamp=datetime.datetime.utcnow()
-    )
-
+    embed = discord.Embed(title=title, url=f"https://twitch.tv/{name}", color=0x9146FF)
     embed.add_field(name="Game", value=game)
-    embed.set_image(url=thumbnail)
 
-    if profile_url:
-        embed.set_thumbnail(url=profile_url)
-
-    embed.set_footer(
-        text="Twitch • Test Notification",
-        icon_url="https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
-    )
-
-    # Send
     await channel.send(f"{role_ping}\n{msg}", embed=embed)
     await interaction.response.send_message("Test sent.", ephemeral=True)
 
@@ -333,6 +346,9 @@ async def check_streams():
             continue
 
         channel = client.get_channel(g[0])
+        if not channel:
+            continue
+
         role_ping = f"<@&{g[1]}>" if g[1] else ""
 
         cursor.execute("SELECT streamer_name, profile_url FROM streamers WHERE guild_id=?", (guild_id,))
@@ -357,10 +373,7 @@ async def check_streams():
             current_id = current["id"] if current else None
 
             if current and current_id != prev_id:
-                msg = custom_msg or "**{streamer} is live!**"
-                msg = msg.replace("{streamer}", name)
-                msg = msg.replace("{game}", current["game_name"])
-                msg = msg.replace("{title}", current["title"])
+                msg = format_message(custom_msg, name, current["game_name"], current["title"])
 
                 embed = discord.Embed(
                     title=current["title"],
@@ -390,6 +403,11 @@ async def on_ready():
     await tree.sync()
     check_streams.start()
     print(f"Logged in as {client.user}")
+
+@client.event
+async def on_close():
+    if session:
+        await session.close()
 
 # RUN
 client.run(TOKEN)
