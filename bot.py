@@ -476,14 +476,14 @@ class TwitchLiveBot(commands.Bot):
 bot = TwitchLiveBot()
 
 
-def guild_only() -> app_commands.Check:
+def guild_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         return interaction.guild is not None and isinstance(interaction.user, discord.Member)
 
     return app_commands.check(predicate)
 
 
-def manager_only() -> app_commands.Check:
+def manager_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return False
@@ -492,7 +492,7 @@ def manager_only() -> app_commands.Check:
     return app_commands.check(predicate)
 
 
-def admin_only() -> app_commands.Check:
+def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return False
