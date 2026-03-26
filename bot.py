@@ -1,13 +1,14 @@
 import asyncio
+from collections import defaultdict
 import datetime as dt
 import logging
 import os
 import random
-import sqlite3
 from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -22,6 +23,7 @@ STREAMER_LIMIT = int(os.getenv("STREAMER_LIMIT", "20"))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "2"))
 DEFAULT_MESSAGE = "**{streamer} is live now on Twitch!**"
 TWITCH_COLOR = 0x9146FF
+TWITCH_BATCH_SIZE = 100
 
 
 logging.basicConfig(
@@ -42,56 +44,125 @@ class GuildConfig:
 
 class Database:
     def __init__(self, path: str) -> None:
-        self.conn = sqlite3.connect(path)
-        self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self.path = path
+        self.conn: Optional[aiosqlite.Connection] = None
 
-    def _init_schema(self) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id INTEGER PRIMARY KEY,
-                    channel_id INTEGER,
-                    role_id INTEGER,
-                    manager_role_id INTEGER,
-                    custom_message TEXT
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS streamers (
-                    guild_id INTEGER NOT NULL,
-                    streamer_name TEXT NOT NULL,
-                    profile_url TEXT,
-                    PRIMARY KEY (guild_id, streamer_name)
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS live_status (
-                    guild_id INTEGER NOT NULL,
-                    streamer_name TEXT NOT NULL,
-                    stream_id TEXT,
-                    PRIMARY KEY (guild_id, streamer_name)
-                )
-                """
-            )
+    async def start(self) -> None:
+        if self.conn is not None:
+            return
 
-    def close(self) -> None:
-        self.conn.close()
+        self.conn = await aiosqlite.connect(self.path)
+        self.conn.row_factory = aiosqlite.Row
+        await self._init_schema()
 
-    def get_guild_config(self, guild_id: int) -> GuildConfig:
-        row = self.conn.execute(
+    async def _init_schema(self) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                role_id INTEGER,
+                manager_role_id INTEGER,
+                custom_message TEXT
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS streamers (
+                guild_id INTEGER NOT NULL,
+                streamer_name TEXT NOT NULL,
+                profile_url TEXT,
+                PRIMARY KEY (guild_id, streamer_name)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_status (
+                guild_id INTEGER NOT NULL,
+                streamer_name TEXT NOT NULL,
+                stream_id TEXT,
+                PRIMARY KEY (guild_id, streamer_name)
+            )
+            """
+        )
+        await self._migrate_legacy_schema()
+        await conn.commit()
+
+    async def _migrate_legacy_schema(self) -> None:
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ) as cursor:
+            table_rows = await cursor.fetchall()
+
+        existing_tables = {row["name"] for row in table_rows}
+        legacy_tables = {"guilds", "settings", "manager_roles"}
+        if not legacy_tables.issubset(existing_tables):
+            return
+
+        await conn.execute(
+            """
+            INSERT INTO guild_settings (
+                guild_id,
+                channel_id,
+                role_id,
+                manager_role_id,
+                custom_message
+            )
+            SELECT
+                CAST(keys.guild_id AS INTEGER),
+                guilds.channel_id,
+                guilds.role_id,
+                manager_roles.role_id,
+                settings.custom_message
+            FROM (
+                SELECT guild_id FROM guilds
+                UNION
+                SELECT guild_id FROM settings
+                UNION
+                SELECT guild_id FROM manager_roles
+            ) AS keys
+            LEFT JOIN guilds ON guilds.guild_id = keys.guild_id
+            LEFT JOIN settings ON settings.guild_id = keys.guild_id
+            LEFT JOIN manager_roles ON manager_roles.guild_id = keys.guild_id
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id = COALESCE(guild_settings.channel_id, excluded.channel_id),
+                role_id = COALESCE(guild_settings.role_id, excluded.role_id),
+                manager_role_id = COALESCE(
+                    guild_settings.manager_role_id,
+                    excluded.manager_role_id
+                ),
+                custom_message = COALESCE(
+                    guild_settings.custom_message,
+                    excluded.custom_message
+                )
+            """
+        )
+
+    async def close(self) -> None:
+        if self.conn is not None:
+            await self.conn.close()
+            self.conn = None
+
+    def _require_conn(self) -> aiosqlite.Connection:
+        if self.conn is None:
+            raise RuntimeError("Database has not been started yet.")
+        return self.conn
+
+    async def get_guild_config(self, guild_id: int) -> GuildConfig:
+        conn = self._require_conn()
+        async with conn.execute(
             """
             SELECT guild_id, channel_id, role_id, manager_role_id, custom_message
             FROM guild_settings
             WHERE guild_id = ?
             """,
             (guild_id,),
-        ).fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
 
         if row is None:
             return GuildConfig(
@@ -110,7 +181,7 @@ class Database:
             custom_message=row["custom_message"],
         )
 
-    def upsert_guild_config(
+    async def upsert_guild_config(
         self,
         guild_id: int,
         *,
@@ -119,35 +190,37 @@ class Database:
         manager_role_id: Optional[int] = None,
         custom_message: Optional[str] = None,
     ) -> None:
-        current = self.get_guild_config(guild_id)
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO guild_settings (
-                    guild_id,
-                    channel_id,
-                    role_id,
-                    manager_role_id,
-                    custom_message
-                )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(guild_id) DO UPDATE SET
-                    channel_id = excluded.channel_id,
-                    role_id = excluded.role_id,
-                    manager_role_id = excluded.manager_role_id,
-                    custom_message = excluded.custom_message
-                """,
-                (
-                    guild_id,
-                    current.channel_id if channel_id is None else channel_id,
-                    current.role_id if role_id is None else role_id,
-                    current.manager_role_id if manager_role_id is None else manager_role_id,
-                    current.custom_message if custom_message is None else custom_message,
-                ),
+        current = await self.get_guild_config(guild_id)
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO guild_settings (
+                guild_id,
+                channel_id,
+                role_id,
+                manager_role_id,
+                custom_message
             )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                role_id = excluded.role_id,
+                manager_role_id = excluded.manager_role_id,
+                custom_message = excluded.custom_message
+            """,
+            (
+                guild_id,
+                current.channel_id if channel_id is None else channel_id,
+                current.role_id if role_id is None else role_id,
+                current.manager_role_id if manager_role_id is None else manager_role_id,
+                current.custom_message if custom_message is None else custom_message,
+            ),
+        )
+        await conn.commit()
 
-    def get_streamers(self, guild_id: int) -> list[sqlite3.Row]:
-        return self.conn.execute(
+    async def get_streamers(self, guild_id: int) -> list[aiosqlite.Row]:
+        conn = self._require_conn()
+        async with conn.execute(
             """
             SELECT streamer_name, profile_url
             FROM streamers
@@ -155,69 +228,87 @@ class Database:
             ORDER BY streamer_name COLLATE NOCASE
             """,
             (guild_id,),
-        ).fetchall()
+        ) as cursor:
+            return await cursor.fetchall()
 
-    def count_streamers(self, guild_id: int) -> int:
-        row = self.conn.execute(
+    async def count_streamers(self, guild_id: int) -> int:
+        conn = self._require_conn()
+        async with conn.execute(
             "SELECT COUNT(*) AS count FROM streamers WHERE guild_id = ?",
             (guild_id,),
-        ).fetchone()
+        ) as cursor:
+            row = await cursor.fetchone()
         return int(row["count"])
 
-    def add_streamer(self, guild_id: int, streamer_name: str, profile_url: str) -> bool:
+    async def add_streamer(self, guild_id: int, streamer_name: str, profile_url: str) -> bool:
+        conn = self._require_conn()
         try:
-            with self.conn:
-                self.conn.execute(
-                    """
-                    INSERT INTO streamers (guild_id, streamer_name, profile_url)
-                    VALUES (?, ?, ?)
-                    """,
-                    (guild_id, streamer_name, profile_url),
-                )
+            await conn.execute(
+                """
+                INSERT INTO streamers (guild_id, streamer_name, profile_url)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, streamer_name, profile_url),
+            )
+            await conn.commit()
             return True
-        except sqlite3.IntegrityError:
+        except aiosqlite.IntegrityError:
             return False
 
-    def remove_streamer(self, guild_id: int, streamer_name: str) -> int:
-        with self.conn:
-            self.conn.execute(
-                "DELETE FROM live_status WHERE guild_id = ? AND streamer_name = ?",
-                (guild_id, streamer_name),
-            )
-            result = self.conn.execute(
-                "DELETE FROM streamers WHERE guild_id = ? AND streamer_name = ?",
-                (guild_id, streamer_name),
-            )
-        return result.rowcount
-
-    def get_all_guild_ids_with_streamers(self) -> list[int]:
-        rows = self.conn.execute("SELECT DISTINCT guild_id FROM streamers").fetchall()
-        return [int(row["guild_id"]) for row in rows]
-
-    def get_live_status(self, guild_id: int, streamer_name: str) -> Optional[str]:
-        row = self.conn.execute(
-            """
-            SELECT stream_id
-            FROM live_status
-            WHERE guild_id = ? AND streamer_name = ?
-            """,
+    async def remove_streamer(self, guild_id: int, streamer_name: str) -> int:
+        conn = self._require_conn()
+        await conn.execute(
+            "DELETE FROM live_status WHERE guild_id = ? AND streamer_name = ?",
             (guild_id, streamer_name),
-        ).fetchone()
-        if row is None:
-            return None
-        return row["stream_id"]
+        )
+        cursor = await conn.execute(
+            "DELETE FROM streamers WHERE guild_id = ? AND streamer_name = ?",
+            (guild_id, streamer_name),
+        )
+        await conn.commit()
+        return cursor.rowcount
 
-    def set_live_status(self, guild_id: int, streamer_name: str, stream_id: Optional[str]) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                INSERT INTO live_status (guild_id, streamer_name, stream_id)
-                VALUES (?, ?, ?)
-                ON CONFLICT(guild_id, streamer_name) DO UPDATE SET
-                    stream_id = excluded.stream_id
-                """,
-                (guild_id, streamer_name, stream_id),
-            )
+    async def get_all_tracked_streamers(self) -> list[aiosqlite.Row]:
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            SELECT guild_id, streamer_name, profile_url
+            FROM streamers
+            ORDER BY guild_id, streamer_name COLLATE NOCASE
+            """
+        ) as cursor:
+            return await cursor.fetchall()
+
+    async def get_live_statuses(self, guild_id: int) -> dict[str, Optional[str]]:
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            SELECT streamer_name, stream_id
+            FROM live_status
+            WHERE guild_id = ?
+            """,
+            (guild_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return {row["streamer_name"]: row["stream_id"] for row in rows}
+
+    async def set_live_statuses(
+        self, entries: list[tuple[int, str, Optional[str]]]
+    ) -> None:
+        if not entries:
+            return
+
+        conn = self._require_conn()
+        await conn.executemany(
+            """
+            INSERT INTO live_status (guild_id, streamer_name, stream_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, streamer_name) DO UPDATE SET
+                stream_id = excluded.stream_id
+            """,
+            entries,
+        )
+        await conn.commit()
 
 
 class TwitchClient:
@@ -287,25 +378,37 @@ class TwitchClient:
             response.raise_for_status()
             return await response.json()
 
+    @staticmethod
+    def _chunked(items: list[str], size: int) -> list[list[str]]:
+        return [items[index : index + size] for index in range(0, len(items), size)]
+
     async def get_profiles(self, usernames: list[str]) -> dict[str, dict]:
         if not usernames:
             return {}
 
-        data = await self._request(
-            "https://api.twitch.tv/helix/users",
-            [("login", username) for username in usernames],
-        )
-        return {entry["login"].lower(): entry for entry in data.get("data", [])}
+        profiles: dict[str, dict] = {}
+        for batch in self._chunked(usernames, TWITCH_BATCH_SIZE):
+            data = await self._request(
+                "https://api.twitch.tv/helix/users",
+                [("login", username) for username in batch],
+            )
+            for entry in data.get("data", []):
+                profiles[entry["login"].lower()] = entry
+        return profiles
 
     async def get_streams(self, usernames: list[str]) -> dict[str, dict]:
         if not usernames:
             return {}
 
-        data = await self._request(
-            "https://api.twitch.tv/helix/streams",
-            [("user_login", username) for username in usernames],
-        )
-        return {entry["user_login"].lower(): entry for entry in data.get("data", [])}
+        live_streams: dict[str, dict] = {}
+        for batch in self._chunked(usernames, TWITCH_BATCH_SIZE):
+            data = await self._request(
+                "https://api.twitch.tv/helix/streams",
+                [("user_login", username) for username in batch],
+            )
+            for entry in data.get("data", []):
+                live_streams[entry["user_login"].lower()] = entry
+        return live_streams
 
 
 class TwitchLiveBot(commands.Bot):
@@ -317,13 +420,15 @@ class TwitchLiveBot(commands.Bot):
         self.tree.on_error = self.on_app_command_error
 
     async def setup_hook(self) -> None:
+        await self.db.start()
         await self.twitch.start()
-        self.check_streams.start()
+        if not self.check_streams.is_running():
+            self.check_streams.start()
 
     async def close(self) -> None:
         self.check_streams.cancel()
         await self.twitch.close()
-        self.db.close()
+        await self.db.close()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -334,28 +439,52 @@ class TwitchLiveBot(commands.Bot):
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        logger.exception("Application command error", exc_info=error)
+        root_error = getattr(error, "original", error)
         message = "Something went wrong while running that command."
 
         if isinstance(error, app_commands.CheckFailure):
             message = "You do not have permission to use that command."
         elif isinstance(error, app_commands.CommandOnCooldown):
             message = f"That command is on cooldown. Try again in {error.retry_after:.1f}s."
+        elif isinstance(root_error, aiohttp.ClientError):
+            message = "Twitch could not be reached right now. Please try again in a moment."
+            logger.warning("Twitch request failed during command execution", exc_info=root_error)
+        else:
+            logger.exception("Application command error", exc_info=error)
 
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
 
-    def is_manager(self, member: discord.Member) -> bool:
+    async def is_manager(self, member: discord.Member) -> bool:
         if member.guild_permissions.manage_guild or member.id == member.guild.owner_id:
             return True
 
-        config = self.db.get_guild_config(member.guild.id)
+        config = await self.db.get_guild_config(member.guild.id)
         if config.manager_role_id is None:
             return False
 
         return any(role.id == config.manager_role_id for role in member.roles)
+
+    async def get_notification_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
+        channel = self.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+        try:
+            fetched = await self.fetch_channel(channel_id)
+        except discord.Forbidden:
+            logger.warning("Missing permission to fetch channel %s", channel_id)
+            return None
+        except discord.NotFound:
+            logger.warning("Configured channel %s no longer exists", channel_id)
+            return None
+        except discord.HTTPException:
+            logger.exception("Failed to fetch configured channel %s", channel_id)
+            return None
+
+        return fetched if isinstance(fetched, discord.TextChannel) else None
 
     def build_live_embed(
         self,
@@ -410,14 +539,14 @@ class TwitchLiveBot(commands.Bot):
         streamer_name: str,
         profile_url: Optional[str],
         stream_data: dict,
-    ) -> None:
-        config = self.db.get_guild_config(guild_id)
+    ) -> bool:
+        config = await self.db.get_guild_config(guild_id)
         if config.channel_id is None:
-            return
+            return False
 
-        channel = self.get_channel(config.channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            return
+        channel = await self.get_notification_channel(config.channel_id)
+        if channel is None:
+            return False
 
         message = self.format_custom_message(
             config.custom_message,
@@ -434,43 +563,76 @@ class TwitchLiveBot(commands.Bot):
             thumbnail_url=stream_data.get("thumbnail_url"),
             started_at=stream_data.get("started_at"),
         )
-        await channel.send(f"{role_ping}{message}", embed=embed)
+
+        try:
+            await channel.send(f"{role_ping}{message}", embed=embed)
+            return True
+        except discord.Forbidden:
+            logger.warning(
+                "Missing permission to send messages in channel %s for guild %s",
+                channel.id,
+                guild_id,
+            )
+        except discord.NotFound:
+            logger.warning("Notification channel %s disappeared before sending", channel.id)
+        except discord.HTTPException:
+            logger.exception(
+                "Discord rejected a live notification for guild %s and streamer %s",
+                guild_id,
+                streamer_name,
+            )
+
+        return False
 
     @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
     async def check_streams(self) -> None:
-        for guild_id in self.db.get_all_guild_ids_with_streamers():
-            try:
-                await self._check_guild_streams(guild_id)
-            except Exception:
-                logger.exception("Failed while checking streams for guild %s", guild_id)
+        tracked_rows = await self.db.get_all_tracked_streamers()
+        if not tracked_rows:
+            return
+
+        streamers_by_guild: dict[int, list[aiosqlite.Row]] = defaultdict(list)
+        unique_usernames: set[str] = set()
+
+        for row in tracked_rows:
+            guild_id = int(row["guild_id"])
+            streamers_by_guild[guild_id].append(row)
+            unique_usernames.add(row["streamer_name"])
+
+        try:
+            live_map = await self.twitch.get_streams(sorted(unique_usernames))
+        except aiohttp.ClientError:
+            logger.exception("Failed to fetch Twitch live data")
+            return
+
+        status_updates: list[tuple[int, str, Optional[str]]] = []
+
+        for guild_id, streamer_rows in streamers_by_guild.items():
+            previous_statuses = await self.db.get_live_statuses(guild_id)
+
+            for row in streamer_rows:
+                streamer_name = row["streamer_name"]
+                current_stream = live_map.get(streamer_name)
+                current_stream_id = current_stream["id"] if current_stream else None
+                previous_stream_id = previous_statuses.get(streamer_name)
+
+                next_status = current_stream_id
+                if current_stream and current_stream_id != previous_stream_id:
+                    sent = await self.send_stream_notification(
+                        guild_id,
+                        streamer_name,
+                        row["profile_url"],
+                        current_stream,
+                    )
+                    if not sent:
+                        next_status = previous_stream_id
+
+                status_updates.append((guild_id, streamer_name, next_status))
+
+        await self.db.set_live_statuses(status_updates)
 
     @check_streams.before_loop
     async def before_check_streams(self) -> None:
         await self.wait_until_ready()
-
-    async def _check_guild_streams(self, guild_id: int) -> None:
-        streamers = self.db.get_streamers(guild_id)
-        if not streamers:
-            return
-
-        names = [row["streamer_name"] for row in streamers]
-        profile_map = {row["streamer_name"]: row["profile_url"] for row in streamers}
-        live_map = await self.twitch.get_streams(names)
-
-        for name in names:
-            current_stream = live_map.get(name)
-            current_stream_id = current_stream["id"] if current_stream else None
-            previous_stream_id = self.db.get_live_status(guild_id, name)
-
-            if current_stream and current_stream_id != previous_stream_id:
-                await self.send_stream_notification(
-                    guild_id,
-                    name,
-                    profile_map.get(name),
-                    current_stream,
-                )
-
-            self.db.set_live_status(guild_id, name, current_stream_id)
 
 
 bot = TwitchLiveBot()
@@ -487,7 +649,7 @@ def manager_only():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return False
-        return bot.is_manager(interaction.user)
+        return await bot.is_manager(interaction.user)
 
     return app_commands.check(predicate)
 
@@ -512,7 +674,7 @@ async def ping(interaction: discord.Interaction) -> None:
 @manager_only()
 async def setup(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
-    bot.db.upsert_guild_config(interaction.guild.id, channel_id=interaction.channel_id)
+    await bot.db.upsert_guild_config(interaction.guild.id, channel_id=interaction.channel_id)
     await interaction.response.send_message(
         f"Setup complete. Live notifications will be sent in {interaction.channel.mention}."
     )
@@ -523,7 +685,7 @@ async def setup(interaction: discord.Interaction) -> None:
 @manager_only()
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
     assert interaction.guild is not None
-    bot.db.upsert_guild_config(interaction.guild.id, channel_id=channel.id)
+    await bot.db.upsert_guild_config(interaction.guild.id, channel_id=channel.id)
     await interaction.response.send_message(f"Live alert channel set to {channel.mention}.")
 
 
@@ -532,7 +694,7 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
 @manager_only()
 async def set_role(interaction: discord.Interaction, role: discord.Role) -> None:
     assert interaction.guild is not None
-    bot.db.upsert_guild_config(interaction.guild.id, role_id=role.id)
+    await bot.db.upsert_guild_config(interaction.guild.id, role_id=role.id)
     await interaction.response.send_message(f"{role.mention} will now be pinged for live alerts.")
 
 
@@ -541,7 +703,7 @@ async def set_role(interaction: discord.Interaction, role: discord.Role) -> None
 @admin_only()
 async def set_manager_role(interaction: discord.Interaction, role: discord.Role) -> None:
     assert interaction.guild is not None
-    bot.db.upsert_guild_config(interaction.guild.id, manager_role_id=role.id)
+    await bot.db.upsert_guild_config(interaction.guild.id, manager_role_id=role.id)
     await interaction.response.send_message(f"{role.mention} can now manage this bot.")
 
 
@@ -553,7 +715,7 @@ async def set_manager_role(interaction: discord.Interaction, role: discord.Role)
 )
 async def set_message(interaction: discord.Interaction, message: str) -> None:
     assert interaction.guild is not None
-    bot.db.upsert_guild_config(interaction.guild.id, custom_message=message)
+    await bot.db.upsert_guild_config(interaction.guild.id, custom_message=message)
     await interaction.response.send_message("Custom live message updated.")
 
 
@@ -561,7 +723,7 @@ async def set_message(interaction: discord.Interaction, message: str) -> None:
 @guild_only()
 async def list_streamers(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
-    rows = bot.db.get_streamers(interaction.guild.id)
+    rows = await bot.db.get_streamers(interaction.guild.id)
     if not rows:
         await interaction.response.send_message("No streamers have been added yet.")
         return
@@ -581,7 +743,7 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str) -> 
         await interaction.response.send_message("Please provide a valid streamer name.", ephemeral=True)
         return
 
-    if bot.db.count_streamers(interaction.guild.id) >= STREAMER_LIMIT:
+    if await bot.db.count_streamers(interaction.guild.id) >= STREAMER_LIMIT:
         await interaction.response.send_message(
             f"You have reached the limit of {STREAMER_LIMIT} streamers.",
             ephemeral=True,
@@ -596,7 +758,7 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str) -> 
         await interaction.followup.send("That Twitch streamer could not be found.", ephemeral=True)
         return
 
-    added = bot.db.add_streamer(
+    added = await bot.db.add_streamer(
         interaction.guild.id,
         normalized_name,
         profile.get("profile_image_url", ""),
@@ -614,7 +776,7 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str) -> 
 async def remove_streamer(interaction: discord.Interaction, streamer_name: str) -> None:
     assert interaction.guild is not None
     normalized_name = streamer_name.strip().lower()
-    deleted = bot.db.remove_streamer(interaction.guild.id, normalized_name)
+    deleted = await bot.db.remove_streamer(interaction.guild.id, normalized_name)
 
     if deleted:
         await interaction.response.send_message(f"Removed `{normalized_name}` from the tracked list.")
@@ -630,7 +792,7 @@ async def remove_streamer(interaction: discord.Interaction, streamer_name: str) 
 @manager_only()
 async def test(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
-    config = bot.db.get_guild_config(interaction.guild.id)
+    config = await bot.db.get_guild_config(interaction.guild.id)
 
     if config.channel_id is None:
         await interaction.response.send_message(
@@ -639,7 +801,7 @@ async def test(interaction: discord.Interaction) -> None:
         )
         return
 
-    rows = bot.db.get_streamers(interaction.guild.id)
+    rows = await bot.db.get_streamers(interaction.guild.id)
     if not rows:
         await interaction.response.send_message(
             "Add at least one streamer first with `/add_streamer`.",
@@ -661,13 +823,19 @@ async def test(interaction: discord.Interaction) -> None:
         "started_at": None if stream is None else stream.get("started_at"),
     }
 
-    await bot.send_stream_notification(
+    sent = await bot.send_stream_notification(
         interaction.guild.id,
         streamer_name,
         selected["profile_url"],
         mock_stream,
     )
-    await interaction.followup.send("Test notification sent.")
+    if sent:
+        await interaction.followup.send("Test notification sent.")
+    else:
+        await interaction.followup.send(
+            "The test notification could not be sent. Check the configured channel and bot permissions.",
+            ephemeral=True,
+        )
 
 
 async def main() -> None:
