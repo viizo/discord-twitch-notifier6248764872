@@ -252,6 +252,7 @@ async def set_message(interaction: discord.Interaction, message: str):
 async def test(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
 
+    # Get channel + role
     cursor.execute("SELECT channel_id, role_id FROM guilds WHERE guild_id=?", (guild_id,))
     result = cursor.fetchone()
 
@@ -262,25 +263,61 @@ async def test(interaction: discord.Interaction):
     channel = client.get_channel(result[0])
     role_ping = f"<@&{result[1]}>" if result[1] else ""
 
-    cursor.execute("SELECT streamer_name FROM streamers WHERE guild_id=?", (guild_id,))
+    # Get streamers
+    cursor.execute("SELECT streamer_name, profile_url FROM streamers WHERE guild_id=?", (guild_id,))
     rows = cursor.fetchall()
 
     if not rows:
         await interaction.response.send_message("Add a streamer first.", ephemeral=True)
         return
 
-    name = random.choice(rows)[0]
+    # Pick random streamer
+    name, profile_url = random.choice(rows)
 
+    # Try real data
+    streams = await get_streams([name])
+    stream_data = streams[0] if streams else None
+
+    if stream_data:
+        title = stream_data["title"]
+        game = stream_data["game_name"]
+        thumbnail = stream_data["thumbnail_url"].replace("{width}", "640").replace("{height}", "360")
+    else:
+        title = "Test Stream"
+        game = "Just Chatting"
+        thumbnail = "https://static-cdn.jtvnw.net/previews-ttv/live_user_test-640x360.jpg"
+
+    # Get custom message
+    cursor.execute("SELECT custom_message FROM settings WHERE guild_id=?", (guild_id,))
+    msg_row = cursor.fetchone()
+    custom_msg = msg_row[0] if msg_row else None
+
+    msg = custom_msg or "**{streamer} is live!**"
+    msg = msg.replace("{streamer}", name)
+    msg = msg.replace("{game}", game)
+    msg = msg.replace("{title}", title)
+
+    # Embed
     embed = discord.Embed(
-        title="Test Stream",
+        title=title,
         url=f"https://twitch.tv/{name}",
-        color=0x9146FF
+        color=0x9146FF,
+        timestamp=datetime.datetime.utcnow()
     )
 
-    embed.add_field(name="Game", value="Just Chatting")
-    embed.set_image(url="https://static-cdn.jtvnw.net/previews-ttv/live_user_test-640x360.jpg")
+    embed.add_field(name="Game", value=game)
+    embed.set_image(url=thumbnail)
 
-    await channel.send(f"{role_ping}\n**{name} is live!**", embed=embed)
+    if profile_url:
+        embed.set_thumbnail(url=profile_url)
+
+    embed.set_footer(
+        text="Twitch • Test Notification",
+        icon_url="https://static.twitchcdn.net/assets/favicon-32-e29e246c157142c94346.png"
+    )
+
+    # Send
+    await channel.send(f"{role_ping}\n{msg}", embed=embed)
     await interaction.response.send_message("Test sent.", ephemeral=True)
 
 # LOOP
